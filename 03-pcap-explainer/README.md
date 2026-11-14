@@ -1,8 +1,12 @@
-# PCAP Explainer
+# PCAP Explainer (V6)
 
 A Python desktop application that captures live network traffic, parses packet telemetry via `dumpcap` and `tshark`, reconstructs DNS and TCP activity, validates 3-way handshakes, and translates raw packet data into human-readable security context.
 
 Built as part of an active home lab portfolio on **Arch Linux**, focusing on network visibility, endpoint vs. network telemetry analysis, and technical sales engineering demonstrations.
+
+## Interface Preview
+
+![PCAP Explainer V6 UI](assets/pcap-explainer-v6.png)
 
 ## Architecture & Workflow
 
@@ -12,20 +16,22 @@ Built as part of an active home lab portfolio on **Arch Linux**, focusing on net
              ↓ (tshark)
       Parsed Telemetry
              ↓ (Python Parser)
-    Human-Readable Report
+    Structured Metrics & Stream Data
              ↓
-      [ GUI (Tkinter) ]
-       ├── Summary (Overview, Protocol Counts & Likely Services)
-       ├── DNS (Queries, Responses, IPv4/IPv6 Answers & CNAME Aliases)
-       ├── TCP Connections (Stream Reconstitution & 3-Way Handshake Validation)
-       └── Security (Evidence-Based Observations & Cleartext Detection)
+      [ V6 GUI (Tkinter) ]
+       ├── KPI Summary Cards (Total Packets, DNS, TCP, Handshakes, Encrypted, HTTP)
+       ├── Summary Tab (Capture Overview & Top Observed Protocols)
+       ├── DNS Tab (Queries, Responses, IPv4/IPv6 Answers & CNAME Aliases)
+       ├── TCP Connections Tab (Interactive Treeview + Stream Inspector)
+       └── Security Tab (Evidence-Based Observations & Cleartext Detection)
 
 ## Key Features
 
-- **Live Capture Control:** Select active network interfaces (`wlp42s0`, `tailscale0`, `enp43s0`, `lo`), configure capture duration (5–3600 seconds), and run `dumpcap` in a background thread so the UI stays responsive.
-- **TCP Stream Reconstitution:** Tracks IPv4 and `[IPv6]:port` endpoints, calculates packet/byte/payload volume, identifies likely services (HTTPS, HTTP, SSH, DNS), and verifies `SYN` → `SYN/ACK` → `ACK` handshakes.
-- **DNS Visibility:** Parses `A`, `AAAA`, `CNAME`, `PTR`, `MX`, `TXT`, `SRV`, and `HTTPS` records, mapping requested domains to resolved IP addresses.
-- **Evidence-Based Security Context:** Highlights encrypted traffic vs. plaintext HTTP risks without making automated malware verdicts, keeping observations grounded in packet evidence.
+- **Executive KPI Cards:** Instant top-level visibility into packet volume, unique DNS names, TCP conversations, complete 3-way handshakes, encrypted traffic (QUIC/TLS/SSH), and cleartext HTTP exposure.
+- **Interactive TCP Stream Table (`Treeview`):** Color-coded TCP connections (green for complete `SYN` → `SYN/ACK` → `ACK` handshakes, amber for cleartext HTTP) with sortable columns and a synchronized **Selected TCP Stream Inspector**.
+- **Live Capture Control & Wireshark Handoff:** Select active network interfaces (`wlp42s0`, `tailscale0`, `enp43s0`, `lo`), configure capture duration (5–3600 seconds) in a background thread, or open the active `.pcapng` directly in Wireshark with one click.
+- **DNS Visibility:** Parses `A`, `AAAA`, `CNAME`, `PTR`, `MX`, `TXT`, `SRV`, and `HTTPS` service-binding records, mapping requested domains to resolved IPv4/IPv6 addresses.
+- **Evidence-Based Security Context:** Highlights encrypted vs. plaintext traffic without making automated malware verdicts, keeping observations grounded in packet evidence.
 
 ## Tech Stack & Environment
 

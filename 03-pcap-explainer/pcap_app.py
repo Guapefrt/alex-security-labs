@@ -1,930 +1,374 @@
+import os
+import re
 import subprocess
 import threading
-from collections import Counter
-from contextlib import redirect_stdout
 from datetime import datetime
-from io import StringIO
-from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from pcap_explainer import (
-    print_dns_activity,
-    print_security_summary,
-    print_tcp_conversations,
-    read_dns_activity,
-    read_protocols,
-    read_tcp_conversations,
-)
+from pcap_explainer import build_tab_reports
 
 
-BASE_DIRECTORY = Path(__file__).resolve().parent
-CAPTURE_DIRECTORY = BASE_DIRECTORY / "captures"
+class PcapExplainerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("PCAP Explainer V6 — Network Telemetry & Security Context")
+        self.geometry("1220x820")
+        self.minsize(980, 680)
 
+        self.captures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
+        os.makedirs(self.captures_dir, exist_ok=True)
 
-def get_capture_interfaces():
-    """Return the local interfaces available through dumpcap."""
+        self.current_pcap: str | None = None
+        self.is_capturing = False
+        self.stream_cache: dict[str, str] = {}
+        self.card_vars: dict[str, tk.StringVar] = {}
+        self.card_value_labels: dict[str, ttk.Label] = {}
 
-    result = subprocess.run(
-        ["dumpcap", "-D"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+        self._configure_styles()
+        self._build_ui()
+        self._populate_interfaces()
 
-    interfaces = []
+    def _configure_styles(self):
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
 
-    for line in result.stdout.splitlines():
-        line = line.strip()
+        style.configure("Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
+        style.configure("CardTitle.TLabel", background="#ffffff", foreground="#5f6368", font=("Sans", 9, "bold"))
+        style.configure("CardValue.TLabel", background="#ffffff", foreground="#1a73e8", font=("Sans", 18, "bold"))
+        style.configure("CardSafe.TLabel", background="#ffffff", foreground="#137333", font=("Sans", 18, "bold"))
+        style.configure("CardWarn.TLabel", background="#ffffff", foreground="#c5221f", font=("Sans", 18, "bold"))
+        style.configure("Treeview", rowheight=26, font=("Monospace", 9))
+        style.configure("Treeview.Heading", font=("Sans", 9, "bold"))
 
-        if not line or ". " not in line:
-            continue
+    def _build_ui(self):
+        # Top Control Toolbar
+        toolbar = ttk.Frame(self, padding=(12, 10))
+        toolbar.pack(fill="x")
 
-        _, interface_description = line.split(". ", 1)
-        interface_name = interface_description.split()[0]
+        ttk.Label(toolbar, text="Interface:", font=("Sans", 9, "bold")).pack(side="left", padx=(0, 5))
+        self.iface_var = tk.StringVar(value="wlp42s0")
+        self.iface_combo = ttk.Combobox(toolbar, textvariable=self.iface_var, width=16, state="readonly")
+        self.iface_combo.pack(side="left", padx=(0, 12))
 
-        interfaces.append(
-            {
-                "name": interface_name,
-                "description": interface_description,
-            }
+        ttk.Label(toolbar, text="Duration (s):", font=("Sans", 9, "bold")).pack(side="left", padx=(0, 5))
+        self.duration_var = tk.StringVar(value="15")
+        self.duration_spin = ttk.Spinbox(toolbar, from_=5, to=3600, textvariable=self.duration_var, width=7)
+        self.duration_spin.pack(side="left", padx=(0, 14))
+
+        self.capture_btn = ttk.Button(toolbar, text="Start Capture", command=self.start_capture)
+        self.capture_btn.pack(side="left", padx=(0, 8))
+
+        self.open_btn = ttk.Button(toolbar, text="Open PCAP", command=self.open_pcap_dialog)
+        self.open_btn.pack(side="left", padx=(0, 8))
+
+        self.wireshark_btn = ttk.Button(
+            toolbar, text="Open in Wireshark", command=self.open_in_wireshark, state="disabled"
         )
-
-    return interfaces
-
-
-def format_endpoint(ip_address, port):
-    """Format IPv4 and IPv6 endpoints clearly."""
-
-    if ":" in ip_address:
-        return f"[{ip_address}]:{port}"
-
-    return f"{ip_address}:{port}"
-
-
-def build_tab_reports(capture_file):
-    """Build one report for each V5 tab."""
-
-    protocols = read_protocols(capture_file)
-    dns_activity = read_dns_activity(capture_file)
-    tcp_conversations = read_tcp_conversations(capture_file)
-
-    protocol_counts = Counter(protocols)
-
-    encrypted_packets = (
-        protocol_counts.get("TLS", 0)
-        + protocol_counts.get("TLSv1.2", 0)
-        + protocol_counts.get("TLSv1.3", 0)
-        + protocol_counts.get("SSL", 0)
-        + protocol_counts.get("SSH", 0)
-    )
-
-    http_packets = protocol_counts.get("HTTP", 0)
-
-    complete_handshakes = sum(
-        1
-        for conversation in tcp_conversations
-        if (
-            conversation["syn"]
-            and conversation["syn_ack"]
-            and conversation["final_ack"]
-        )
-    )
-
-    service_counts = Counter()
-
-    for conversation in tcp_conversations:
-        port_a = conversation["endpoint_a_port"]
-        port_b = conversation["endpoint_b_port"]
-
-        if 443 in (port_a, port_b):
-            service_counts["HTTPS"] += 1
-        elif 80 in (port_a, port_b):
-            service_counts["HTTP"] += 1
-        elif 22 in (port_a, port_b):
-            service_counts["SSH"] += 1
-        else:
-            service_counts["Other TCP"] += 1
-
-    summary = StringIO()
-
-    with redirect_stdout(summary):
-        print("PCAP EXPLAINER V5")
-        print("=" * 64)
-        print()
-        print(f"Capture: {capture_file.name}")
-        print(f"Packets analyzed: {len(protocols)}")
-        print()
-        print("CAPTURE OVERVIEW")
-        print("-" * 64)
-        print(f"{'Metric':<34} {'Value':>10}")
-        print("-" * 64)
-        print(f"{'Total packets':<34} {len(protocols):>10}")
-        print(f"{'Unique DNS names':<34} {len(dns_activity):>10}")
-        print(f"{'TCP conversations':<34} {len(tcp_conversations):>10}")
-        print(f"{'Complete TCP handshakes':<34} {complete_handshakes:>10}")
-        print(f"{'Encrypted-protocol packets':<34} {encrypted_packets:>10}")
-        print(f"{'HTTP packets':<34} {http_packets:>10}")
-
-        print()
-        print("PROTOCOL COUNTS")
-        print("-" * 64)
-
-        for protocol, count in protocol_counts.most_common():
-            print(f"{protocol:<34} {count:>10}")
-
-        print()
-        print("LIKELY TCP SERVICES")
-        print("-" * 64)
-
-        if service_counts:
-            for service, count in service_counts.most_common():
-                print(f"{service:<34} {count:>10}")
-        else:
-            print("No TCP services were identified.")
-
-    dns = StringIO()
-
-    with redirect_stdout(dns):
-        print_dns_activity(dns_activity)
-
-    tcp = StringIO()
-
-    with redirect_stdout(tcp):
-        print("=== TCP CONNECTIONS ===")
-
-        if not tcp_conversations:
-            print()
-            print("No TCP conversations were found.")
-
-        for conversation in tcp_conversations[:20]:
-            port_a = conversation["endpoint_a_port"]
-            port_b = conversation["endpoint_b_port"]
-
-            if 443 in (port_a, port_b):
-                service = "HTTPS"
-            elif 80 in (port_a, port_b):
-                service = "HTTP"
-            elif 22 in (port_a, port_b):
-                service = "SSH"
-            else:
-                service = "Unknown or application-specific"
-
-            handshake_complete = (
-                conversation["syn"]
-                and conversation["syn_ack"]
-                and conversation["final_ack"]
-            )
-
-            print()
-            print("=" * 72)
-            print(
-                f"TCP Stream {conversation['stream_id']} | "
-                f"Likely service: {service}"
-            )
-            print("-" * 72)
-
-            print(
-                "Endpoint A: "
-                + format_endpoint(
-                    conversation["endpoint_a_ip"],
-                    conversation["endpoint_a_port"],
-                )
-            )
-
-            print(
-                "Endpoint B: "
-                + format_endpoint(
-                    conversation["endpoint_b_ip"],
-                    conversation["endpoint_b_port"],
-                )
-            )
-
-            print()
-            print(f"Packets captured: {conversation['packets']}")
-            print(f"Captured bytes: {conversation['bytes']}")
-            print(f"TCP payload bytes: {conversation['payload_bytes']}")
-
-            print()
-            print("Handshake evidence:")
-            print(
-                "  SYN:     "
-                + (
-                    "detected"
-                    if conversation["syn"]
-                    else "not observed"
-                )
-            )
-            print(
-                "  SYN/ACK: "
-                + (
-                    "detected"
-                    if conversation["syn_ack"]
-                    else "not observed"
-                )
-            )
-            print(
-                "  ACK:     "
-                + (
-                    "detected"
-                    if conversation["final_ack"]
-                    else "not observed"
-                )
-            )
-
-            print()
-
-            if handshake_complete:
-                print(
-                    "Result: TCP connection establishment "
-                    "was observed successfully."
-                )
-            else:
-                print(
-                    "Result: The complete handshake was not visible."
-                )
-                print(
-                    "The connection may have existed before "
-                    "the capture started."
-                )
-
-            print()
-
-            if service == "HTTPS":
-                print(
-                    "Security context: encrypted web traffic is likely."
-                )
-                print(
-                    "IP addresses, ports, timing, and traffic volume "
-                    "remain visible."
-                )
-
-            elif service == "HTTP":
-                print(
-                    "Security context: HTTP does not provide TLS "
-                    "encryption."
-                )
-                print(
-                    "Application content may be visible in the capture."
-                )
-
-            elif service == "SSH":
-                print(
-                    "Security context: encrypted remote administration "
-                    "traffic is likely."
-                )
-
-    security = StringIO()
-
-    with redirect_stdout(security):
-        print_security_summary(
-            protocol_counts,
-            dns_activity,
-        )
-
-        print()
-        print("V5 SECURITY OBSERVATIONS")
-        print("-" * 64)
-
-        if encrypted_packets:
-            print(
-                "[OK] Encrypted traffic was detected: "
-                f"{encrypted_packets} packets."
-            )
-        else:
-            print(
-                "[INFO] No packets were classified as TLS, SSL, or SSH."
-            )
-
-        if dns_activity:
-            print(
-                "[INFO] DNS visibility exposed "
-                f"{len(dns_activity)} unique requested names."
-            )
-
-        if complete_handshakes:
-            print(
-                "[OK] Complete TCP connection establishment was "
-                f"observed for {complete_handshakes} conversations."
-            )
-
-        if http_packets:
-            print(
-                "[WARNING] Unencrypted HTTP traffic was observed: "
-                f"{http_packets} packets."
-            )
-            print(
-                "HTTP application content may be visible "
-                "to a network observer."
-            )
-        else:
-            print(
-                "[OK] No traffic was classified as plaintext HTTP."
-            )
-
-        print()
-        print(
-            "Important: these are evidence-based observations, "
-            "not proof of malicious activity."
-        )
-
-    return {
-        "summary": summary.getvalue(),
-        "dns": dns.getvalue(),
-        "tcp": tcp.getvalue(),
-        "security": security.getvalue(),
-    }
-
-
-class PcapExplainerApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("PCAP Explainer")
-        self.root.geometry("1000x720")
-        self.root.minsize(760, 560)
-
-        self.interfaces = []
-        self.capture_running = False
-
-        CAPTURE_DIRECTORY.mkdir(exist_ok=True)
-
-        self.create_widgets()
-        self.load_interfaces()
-
-    def create_widgets(self):
-        main_frame = ttk.Frame(
-            self.root,
-            padding=16,
-        )
-        main_frame.pack(
-            fill="both",
-            expand=True,
-        )
-
-        title_label = ttk.Label(
-            main_frame,
-            text="PCAP Explainer",
-            font=("Sans", 20, "bold"),
-        )
-        title_label.pack(anchor="w")
-
-        subtitle_label = ttk.Label(
-            main_frame,
-            text=(
-                "Capture traffic from a selected interface and translate "
-                "packet data into a human-readable security report."
-            ),
-        )
-        subtitle_label.pack(
-            anchor="w",
-            pady=(0, 18),
-        )
-
-        settings_frame = ttk.LabelFrame(
-            main_frame,
-            text="Capture settings",
-            padding=12,
-        )
-        settings_frame.pack(fill="x")
-
-        interface_label = ttk.Label(
-            settings_frame,
-            text="Network interface:",
-        )
-        interface_label.grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=(0, 10),
-            pady=6,
-        )
-
-        self.interface_variable = tk.StringVar()
-
-        self.interface_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.interface_variable,
-            state="readonly",
-            width=45,
-        )
-        self.interface_combo.grid(
-            row=0,
-            column=1,
-            sticky="ew",
-            pady=6,
-        )
-
-        refresh_button = ttk.Button(
-            settings_frame,
-            text="Refresh",
-            command=self.load_interfaces,
-        )
-        refresh_button.grid(
-            row=0,
-            column=2,
-            padx=(10, 0),
-            pady=6,
-        )
-
-        duration_label = ttk.Label(
-            settings_frame,
-            text="Duration:",
-        )
-        duration_label.grid(
-            row=1,
-            column=0,
-            sticky="w",
-            padx=(0, 10),
-            pady=6,
-        )
-
-        self.duration_variable = tk.IntVar(value=30)
-
-        self.duration_spinbox = ttk.Spinbox(
-            settings_frame,
-            from_=5,
-            to=3600,
-            increment=5,
-            textvariable=self.duration_variable,
-            width=10,
-        )
-        self.duration_spinbox.grid(
-            row=1,
-            column=1,
-            sticky="w",
-            pady=6,
-        )
-
-        seconds_label = ttk.Label(
-            settings_frame,
-            text="seconds (5 to 3600)",
-        )
-        seconds_label.grid(
-            row=1,
-            column=1,
-            sticky="w",
-            padx=(90, 0),
-            pady=6,
-        )
-
-        settings_frame.columnconfigure(
-            1,
-            weight=1,
-        )
-
-        controls_frame = ttk.Frame(main_frame)
-        controls_frame.pack(
-            fill="x",
-            pady=14,
-        )
-
-        self.start_button = ttk.Button(
-            controls_frame,
-            text="Start Capture",
-            command=self.start_capture,
-        )
-        self.start_button.pack(side="left")
-
-        clear_button = ttk.Button(
-            controls_frame,
-            text="Clear Reports",
-            command=self.clear_reports,
-        )
-        clear_button.pack(
-            side="left",
-            padx=(10, 0),
-        )
-
-        open_folder_button = ttk.Button(
-            controls_frame,
-            text="Open Captures Folder",
-            command=self.open_capture_folder,
-        )
-        open_folder_button.pack(
-            side="left",
-            padx=(10, 0),
-        )
-
-        self.progress_bar = ttk.Progressbar(
-            controls_frame,
-            mode="indeterminate",
-            length=180,
-        )
-        self.progress_bar.pack(side="right")
-
-        self.status_variable = tk.StringVar(
-            value="Ready. Select an interface and capture duration."
-        )
-
-        status_label = ttk.Label(
-            main_frame,
-            textvariable=self.status_variable,
-        )
-        status_label.pack(
-            anchor="w",
-            pady=(0, 8),
-        )
-
-        self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(
-            fill="both",
-            expand=True,
-        )
-
-        self.summary_tab = ttk.Frame(
-            self.notebook,
-            padding=10,
-        )
-        self.dns_tab = ttk.Frame(
-            self.notebook,
-            padding=10,
-        )
-        self.tcp_tab = ttk.Frame(
-            self.notebook,
-            padding=10,
-        )
-        self.security_tab = ttk.Frame(
-            self.notebook,
-            padding=10,
-        )
-
-        self.notebook.add(
-            self.summary_tab,
-            text="Summary",
-        )
-        self.notebook.add(
-            self.dns_tab,
-            text="DNS",
-        )
-        self.notebook.add(
-            self.tcp_tab,
-            text="TCP Connections",
-        )
-        self.notebook.add(
-            self.security_tab,
-            text="Security",
-        )
-
-        self.summary_text = self.create_scrolled_text(
-            self.summary_tab
-        )
-        self.dns_text = self.create_scrolled_text(
-            self.dns_tab
-        )
-        self.tcp_text = self.create_scrolled_text(
-            self.tcp_tab
-        )
-        self.security_text = self.create_scrolled_text(
-            self.security_tab
-        )
-
-        self.summary_text.insert(
-            tk.END,
-            (
-                "PCAP EXPLAINER V5\n\n"
-                "Select a network interface and duration, "
-                "then press Start Capture.\n\n"
-                "Suggested interfaces:\n"
-                "- wlp42s0: normal Wi-Fi traffic\n"
-                "- tailscale0: Tailscale and SSH traffic\n"
-                "- lo: local laptop traffic\n"
-            ),
-        )
-
-    def create_scrolled_text(self, parent):
-        """Create a text area with a vertical scrollbar."""
-
-        container = ttk.Frame(parent)
-        container.pack(
-            fill="both",
-            expand=True,
-        )
-
-        text_widget = tk.Text(
-            container,
-            wrap="word",
-            font=("Monospace", 10),
-            padx=10,
-            pady=10,
-        )
-
-        scrollbar = ttk.Scrollbar(
-            container,
-            orient="vertical",
-            command=text_widget.yview,
-        )
-
-        text_widget.configure(
-            yscrollcommand=scrollbar.set
-        )
-
-        text_widget.pack(
-            side="left",
-            fill="both",
-            expand=True,
-        )
-
-        scrollbar.pack(
-            side="right",
-            fill="y",
-        )
-
-        return text_widget
-
-    def load_interfaces(self):
-        try:
-            self.interfaces = get_capture_interfaces()
-
-        except FileNotFoundError:
-            messagebox.showerror(
-                "dumpcap not found",
-                "dumpcap is not installed or is not available in PATH.",
-            )
-            return
-
-        except subprocess.CalledProcessError as error:
-            messagebox.showerror(
-                "Interface error",
-                f"Could not list capture interfaces.\n\n{error.stderr}",
-            )
-            return
-
-        descriptions = [
-            interface["description"]
-            for interface in self.interfaces
+        self.wireshark_btn.pack(side="right")
+
+        # V6 KPI Summary Cards Row
+        cards_frame = ttk.Frame(self, padding=(12, 4, 12, 10))
+        cards_frame.pack(fill="x")
+
+        card_titles = [
+            "Total Packets",
+            "Unique DNS Names",
+            "TCP Conversations",
+            "Complete Handshakes",
+            "Encrypted Packets",
+            "HTTP Packets",
         ]
 
-        self.interface_combo["values"] = descriptions
+        for idx, title in enumerate(card_titles):
+            cards_frame.columnconfigure(idx, weight=1, uniform="cards")
+            card = ttk.Frame(cards_frame, style="Card.TFrame", padding=(10, 8))
+            card.grid(row=0, column=idx, sticky="nsew", padx=4)
 
-        preferred_interfaces = [
-            "wlp42s0",
-            "tailscale0",
-            "enp43s0",
-            "any",
-        ]
+            lbl_title = ttk.Label(card, text=title.upper(), style="CardTitle.TLabel")
+            lbl_title.pack(anchor="w")
 
-        selected_index = 0
+            var = tk.StringVar(value="0")
+            self.card_vars[title] = var
+            lbl_val = ttk.Label(card, textvariable=var, style="CardValue.TLabel")
+            lbl_val.pack(anchor="w", pady=(4, 0))
+            self.card_value_labels[title] = lbl_val
 
-        for preferred_name in preferred_interfaces:
-            match_found = False
+        # Main Notebook Tabs
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 8))
 
-            for index, interface in enumerate(self.interfaces):
-                if interface["name"] == preferred_name:
-                    selected_index = index
-                    match_found = True
-                    break
+        # Tab 1: Summary
+        summary_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(summary_tab, text="Summary")
+        self.summary_text = scrolledtext.ScrolledText(summary_tab, wrap="word", font=("Monospace", 10), state="disabled")
+        self.summary_text.pack(fill="both", expand=True)
 
-            if match_found:
-                break
+        # Tab 2: DNS
+        dns_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(dns_tab, text="DNS")
+        self.dns_text = scrolledtext.ScrolledText(dns_tab, wrap="word", font=("Monospace", 10), state="disabled")
+        self.dns_text.pack(fill="both", expand=True)
 
-        if descriptions:
-            self.interface_combo.current(selected_index)
-            self.status_variable.set(
-                f"Found {len(descriptions)} capture interfaces."
-            )
-        else:
-            self.status_variable.set(
-                "No capture interfaces were found."
-            )
+        # Tab 3: TCP Connections (Interactive Treeview + Stream Inspector)
+        tcp_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(tcp_tab, text="TCP Connections")
 
-    def get_selected_interface(self):
-        selected_description = self.interface_variable.get()
+        paned = ttk.PanedWindow(tcp_tab, orient="vertical")
+        paned.pack(fill="both", expand=True)
 
-        for interface in self.interfaces:
-            if interface["description"] == selected_description:
-                return interface["name"]
+        tree_container = ttk.Frame(paned)
+        paned.add(tree_container, weight=3)
 
-        return None
+        columns = ("stream", "src", "dst", "service", "packets", "bytes", "handshake")
+        self.tree = ttk.Treeview(tree_container, columns=columns, show="headings", selectmode="browse")
 
-    def validate_duration(self):
-        try:
-            duration = int(self.duration_variable.get())
-
-        except (ValueError, tk.TclError):
-            raise ValueError(
-                "Capture duration must be a whole number."
-            )
-
-        if duration < 5 or duration > 3600:
-            raise ValueError(
-                "Capture duration must be between 5 and 3600 seconds."
-            )
-
-        return duration
-
-    def start_capture(self):
-        if self.capture_running:
-            return
-
-        interface = self.get_selected_interface()
-
-        if not interface:
-            messagebox.showwarning(
-                "No interface",
-                "Select a capture interface first.",
-            )
-            return
-
-        try:
-            duration = self.validate_duration()
-
-        except ValueError as error:
-            messagebox.showwarning(
-                "Invalid duration",
-                str(error),
-            )
-            return
-
-        timestamp = datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
-
-        capture_file = (
-            CAPTURE_DIRECTORY
-            / f"capture_{interface}_{timestamp}.pcapng"
-        )
-
-        self.capture_running = True
-        self.start_button.configure(state="disabled")
-        self.interface_combo.configure(state="disabled")
-        self.duration_spinbox.configure(state="disabled")
-        self.progress_bar.start(10)
-
-        self.status_variable.set(
-            f"Capturing {interface} for {duration} seconds..."
-        )
-
-        self.clear_reports()
-
-        self.summary_text.insert(
-            tk.END,
-            (
-                "Capture started.\n\n"
-                f"Interface: {interface}\n"
-                f"Duration: {duration} seconds\n"
-                f"Output: {capture_file}\n\n"
-                "Generate traffic while capture is running.\n"
-            ),
-        )
-
-        worker = threading.Thread(
-            target=self.capture_and_analyze,
-            args=(
-                interface,
-                duration,
-                capture_file,
-            ),
-            daemon=True,
-        )
-        worker.start()
-
-    def capture_and_analyze(
-        self,
-        interface,
-        duration,
-        capture_file,
-    ):
-        command = [
-            "dumpcap",
-            "-i",
-            interface,
-            "-a",
-            f"duration:{duration}",
-            "-w",
-            str(capture_file),
-        ]
-
-        try:
-            subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-
-            reports = build_tab_reports(capture_file)
-
-            self.root.after(
-                0,
-                self.capture_finished,
-                capture_file,
-                reports,
-            )
-
-        except FileNotFoundError:
-            self.root.after(
-                0,
-                self.capture_failed,
-                "dumpcap is not installed or unavailable in PATH.",
-            )
-
-        except subprocess.CalledProcessError as error:
-            error_message = (
-                error.stderr.strip()
-                or error.stdout.strip()
-                or "dumpcap returned an unknown error."
-            )
-
-            self.root.after(
-                0,
-                self.capture_failed,
-                error_message,
-            )
-
-        except Exception as error:
-            self.root.after(
-                0,
-                self.capture_failed,
-                str(error),
-            )
-
-    def capture_finished(
-        self,
-        capture_file,
-        reports,
-    ):
-        self.capture_running = False
-        self.start_button.configure(state="normal")
-        self.interface_combo.configure(state="readonly")
-        self.duration_spinbox.configure(state="normal")
-        self.progress_bar.stop()
-
-        self.display_tab_reports(reports)
-
-        self.status_variable.set(
-            f"Capture and analysis complete: {capture_file.name}"
-        )
-
-        messagebox.showinfo(
-            "Analysis complete",
-            f"Capture saved to:\n{capture_file}",
-        )
-
-    def capture_failed(self, error_message):
-        self.capture_running = False
-        self.start_button.configure(state="normal")
-        self.interface_combo.configure(state="readonly")
-        self.duration_spinbox.configure(state="normal")
-        self.progress_bar.stop()
-
-        self.status_variable.set("Capture failed.")
-
-        messagebox.showerror(
-            "Capture failed",
-            error_message,
-        )
-
-    def display_tab_reports(self, reports):
-        """Display the four V5 reports."""
-
-        text_widgets = {
-            "summary": self.summary_text,
-            "dns": self.dns_text,
-            "tcp": self.tcp_text,
-            "security": self.security_text,
+        headings = {
+            "stream": ("Stream", 75, "center"),
+            "src": ("Endpoint A (Source)", 260, "w"),
+            "dst": ("Endpoint B (Destination)", 260, "w"),
+            "service": ("Likely Service", 120, "center"),
+            "packets": ("Packets", 90, "e"),
+            "bytes": ("Bytes", 110, "e"),
+            "handshake": ("3-Way Handshake", 140, "center"),
         }
 
-        for report_name, widget in text_widgets.items():
-            widget.delete(
-                "1.0",
-                tk.END,
+        for col, (text, width, anchor) in headings.items():
+            self.tree.heading(col, text=text, command=lambda c=col: self._sort_treeview(c, False))
+            self.tree.column(col, width=width, anchor=anchor)
+
+        # Row color tags
+        self.tree.tag_configure("complete", background="#e6f4ea", foreground="#137333")
+        self.tree.tag_configure("http", background="#fef7e0", foreground="#b06000")
+        self.tree.tag_configure("incomplete", background="#f8f9fa", foreground="#3c4043")
+
+        tree_vsb = ttk.Scrollbar(tree_container, orient="vertical", command=self.tree.yview)
+        tree_hsb = ttk.Scrollbar(tree_container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=tree_vsb.set, xscrollcommand=tree_hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tree_vsb.grid(row=0, column=1, sticky="ns")
+        tree_hsb.grid(row=1, column=0, sticky="ew")
+        tree_container.rowconfigure(0, weight=1)
+        tree_container.columnconfigure(0, weight=1)
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_tcp_select)
+
+        inspector_frame = ttk.LabelFrame(paned, text="Selected TCP Stream Inspector", padding=6)
+        paned.add(inspector_frame, weight=2)
+
+        self.tcp_detail_text = scrolledtext.ScrolledText(
+            inspector_frame, wrap="word", font=("Monospace", 10), height=10, state="disabled"
+        )
+        self.tcp_detail_text.pack(fill="both", expand=True)
+
+        # Tab 4: Security
+        sec_tab = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(sec_tab, text="Security")
+        self.security_text = scrolledtext.ScrolledText(sec_tab, wrap="word", font=("Monospace", 10), state="disabled")
+        self.security_text.pack(fill="both", expand=True)
+
+        # Bottom Status Bar
+        self.status_var = tk.StringVar(value="Ready. Select an interface to capture or open an existing PCAP/PCAPNG file.")
+        status_bar = ttk.Label(self, textvariable=self.status_var, relief="sunken", anchor="w", padding=(10, 4))
+        status_bar.pack(fill="x", side="bottom")
+
+    def _populate_interfaces(self):
+        interfaces = []
+        try:
+            proc = subprocess.run(["dumpcap", "-D"], capture_output=True, text=True, check=False)
+            for line in proc.stdout.splitlines():
+                match = re.match(r"^\d+\.\s+([^\s(]+)", line.strip())
+                if match:
+                    interfaces.append(match.group(1))
+        except Exception:
+            pass
+
+        if not interfaces:
+            interfaces = ["wlp42s0", "tailscale0", "enp43s0", "lo"]
+
+        self.iface_combo["values"] = interfaces
+        if "wlp42s0" in interfaces:
+            self.iface_var.set("wlp42s0")
+        else:
+            self.iface_var.set(interfaces[0])
+
+    def _set_text_widget(self, widget: scrolledtext.ScrolledText, content: str):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", content)
+        widget.configure(state="disabled")
+
+    def start_capture(self):
+        if self.is_capturing:
+            return
+
+        iface = self.iface_var.get().strip()
+        try:
+            duration = int(self.duration_var.get().strip())
+            if duration < 1 or duration > 3600:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Duration", "Please enter a capture duration between 1 and 3600 seconds.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(self.captures_dir, f"capture_{iface}_{timestamp}.pcapng")
+
+        self.is_capturing = True
+        self.capture_btn.configure(state="disabled")
+        self.open_btn.configure(state="disabled")
+        self.status_var.set(f"Capturing on {iface} for {duration}s...")
+
+        def worker():
+            cmd = ["dumpcap", "-i", iface, "-a", f"duration:{duration}", "-w", out_path]
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            self.after(0, lambda: self._on_capture_finished(proc.returncode, proc.stderr, out_path))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_capture_finished(self, returncode: int, stderr: str, out_path: str):
+        self.is_capturing = False
+        self.capture_btn.configure(state="normal")
+        self.open_btn.configure(state="normal")
+
+        if returncode != 0 or not os.path.isfile(out_path):
+            self.status_var.set("Capture failed.")
+            messagebox.showerror("Capture Error", stderr.strip() or "dumpcap failed to capture packets.")
+            return
+
+        self.load_pcap(out_path)
+
+    def open_pcap_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Select PCAP / PCAPNG File",
+            initialdir=self.captures_dir,
+            filetypes=[("Packet Captures", "*.pcapng *.pcap"), ("All Files", "*.*")],
+        )
+        if path:
+            self.load_pcap(path)
+
+    def load_pcap(self, pcap_path: str):
+        self.current_pcap = pcap_path
+        self.status_var.set(f"Analyzing {os.path.basename(pcap_path)}...")
+
+        def worker():
+            try:
+                reports = build_tab_reports(pcap_path)
+                self.after(0, lambda: self.display_tab_reports(reports))
+            except Exception as exc:
+                self.after(0, lambda: self._on_analysis_error(str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_analysis_error(self, err: str):
+        self.status_var.set("Analysis error.")
+        messagebox.showerror("Analysis Error", err)
+
+    def display_tab_reports(self, reports: dict):
+        metrics = reports.get("summary_metrics", {})
+
+        self.card_vars["Total Packets"].set(f"{metrics.get('total_packets', 0):,}")
+        self.card_vars["Unique DNS Names"].set(f"{metrics.get('unique_dns', 0):,}")
+        self.card_vars["TCP Conversations"].set(f"{metrics.get('tcp_conversations', 0):,}")
+        self.card_vars["Complete Handshakes"].set(f"{metrics.get('complete_handshakes', 0):,}")
+        self.card_vars["Encrypted Packets"].set(f"{metrics.get('encrypted_packets', 0):,}")
+
+        http_count = metrics.get("http_packets", 0)
+        self.card_vars["HTTP Packets"].set(f"{http_count:,}")
+        if http_count == 0:
+            self.card_value_labels["HTTP Packets"].configure(style="CardSafe.TLabel")
+        else:
+            self.card_value_labels["HTTP Packets"].configure(style="CardWarn.TLabel")
+
+        self._set_text_widget(self.summary_text, reports.get("summary", ""))
+        self._set_text_widget(self.dns_text, reports.get("dns", ""))
+        self._set_text_widget(self.security_text, reports.get("security", ""))
+
+        # Populate TCP Treeview
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.stream_cache.clear()
+
+        tcp_streams = reports.get("tcp_streams", [])
+        for stream in tcp_streams:
+            sid = str(stream["stream_id"])
+            hs_complete = stream.get("handshake_complete", False)
+            service = stream.get("service", "Unknown / App")
+            hs_label = "Complete" if hs_complete else "Partial"
+
+            if service == "HTTP":
+                tag = "http"
+            elif hs_complete:
+                tag = "complete"
+            else:
+                tag = "incomplete"
+
+            self.stream_cache[sid] = stream.get("details", "")
+            self.tree.insert(
+                "",
+                "end",
+                iid=sid,
+                values=(
+                    sid,
+                    stream.get("src", ""),
+                    stream.get("dst", ""),
+                    service,
+                    stream.get("packets", 0),
+                    stream.get("bytes", 0),
+                    hs_label,
+                ),
+                tags=(tag,),
             )
-            widget.insert(
-                tk.END,
-                reports.get(report_name, ""),
-            )
-            widget.see("1.0")
 
-        self.notebook.select(self.summary_tab)
+        children = self.tree.get_children()
+        if children:
+            self.tree.selection_set(children[0])
+            self.tree.focus(children[0])
+            self.on_tcp_select()
+        else:
+            self._set_text_widget(self.tcp_detail_text, "No TCP streams observed in this capture.")
 
-    def clear_reports(self):
-        """Clear all report tabs."""
-
-        for widget in (
-            self.summary_text,
-            self.dns_text,
-            self.tcp_text,
-            self.security_text,
-        ):
-            widget.delete(
-                "1.0",
-                tk.END,
-            )
-
-    def open_capture_folder(self):
-        subprocess.Popen(
-            [
-                "xdg-open",
-                str(CAPTURE_DIRECTORY),
-            ]
+        self.wireshark_btn.configure(state="normal")
+        self.status_var.set(
+            f"Loaded: {os.path.basename(self.current_pcap)} | "
+            f"{metrics.get('total_packets', 0):,} packets | "
+            f"{metrics.get('tcp_conversations', 0)} TCP streams"
         )
 
+    def on_tcp_select(self, _event=None):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        sid = selected[0]
+        detail_text = self.stream_cache.get(sid, "No details available for this stream.")
+        self._set_text_widget(self.tcp_detail_text, detail_text)
 
-def main():
-    root = tk.Tk()
-    PcapExplainerApp(root)
-    root.mainloop()
+    def _sort_treeview(self, col: str, reverse: bool):
+        numeric_cols = {"stream", "packets", "bytes"}
+        rows = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+
+        if col in numeric_cols:
+            rows.sort(key=lambda t: int(str(t[0]).replace(",", "")), reverse=reverse)
+        else:
+            rows.sort(key=lambda t: str(t[0]).lower(), reverse=reverse)
+
+        for idx, (_, k) in enumerate(rows):
+            self.tree.move(k, "", idx)
+
+        self.tree.heading(col, command=lambda: self._sort_treeview(col, not reverse))
+
+    def open_in_wireshark(self):
+        if not self.current_pcap or not os.path.isfile(self.current_pcap):
+            messagebox.showwarning("No Capture", "Please capture or open a PCAP file first.")
+            return
+        try:
+            subprocess.Popen(["wireshark", self.current_pcap])
+        except FileNotFoundError:
+            messagebox.showerror("Wireshark Not Found", "Could not find the 'wireshark' executable in PATH.")
 
 
 if __name__ == "__main__":
-    main()
+    app = PcapExplainerApp()
+    app.mainloop()

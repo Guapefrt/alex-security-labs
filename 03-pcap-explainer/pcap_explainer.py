@@ -1,752 +1,437 @@
+import os
+import re
 import subprocess
-import sys
-from collections import Counter, defaultdict
-from pathlib import Path
+from collections import defaultdict
 
 
-PROTOCOL_EXPLANATIONS = {
-    "ARP": (
-        "ARP maps a local IPv4 address to a MAC address. "
-        "Devices use ARP when communicating on the same local network."
-    ),
-    "DNS": (
-        "DNS translates domain names such as github.com into IP addresses."
-    ),
-    "TCP": (
-        "TCP provides reliable, connection-oriented transport using "
-        "sequence numbers, acknowledgements, and retransmissions."
-    ),
-    "UDP": (
-        "UDP sends datagrams without establishing a TCP-style connection. "
-        "DNS, discovery, and real-time applications commonly use UDP."
-    ),
-    "SSH": (
-        "SSH provides encrypted remote administration, normally over TCP port 22."
-    ),
-    "TLS": (
-        "TLS encrypts application traffic such as HTTPS."
-    ),
-    "TLSv1.2": (
-        "TLS 1.2 encrypted application traffic was detected. "
-        "The network can observe connection metadata, but not simply read "
-        "the encrypted application content."
-    ),
-    "TLSv1.3": (
-        "TLS 1.3 encrypted traffic was detected. TLS 1.3 uses a simplified "
-        "handshake and modern cryptography."
-    ),
-    "SSL": (
-        "Wireshark classified this traffic using its SSL/TLS dissector. "
-        "Modern secure applications normally use TLS rather than obsolete SSL."
-    ),
-    "ICMP": (
-        "ICMP provides network control and diagnostic messages. "
-        "Ping uses ICMP Echo Request and Echo Reply."
-    ),
-    "ICMPv6": (
-        "ICMPv6 provides diagnostics and essential control functions for IPv6."
-    ),
-    "STUN": (
-        "STUN helps applications discover how their connection appears through NAT. "
-        "It is often associated with WebRTC and peer-to-peer communication."
-    ),
-    "SSDP": (
-        "SSDP is a local service-discovery protocol commonly associated with UPnP."
-    ),
-    "NAT-PMP": (
-        "NAT-PMP allows a device to request port mappings from a NAT gateway."
-    ),
-    "PCP v2": (
-        "PCP allows devices to request and manage mappings through NAT devices "
-        "and firewalls."
-    ),
-    "HTTP": (
-    "HTTP carries web application traffic without TLS encryption. "
-    "Unlike HTTPS, HTTP content can potentially be visible in a packet capture."
-    ),
+DNS_TYPE_MAP = {
+    "1": ("A", "The endpoint asked for an IPv4 address."),
+    "2": ("NS", "The endpoint asked for authoritative name server records."),
+    "5": ("CNAME", "The endpoint asked for a canonical domain alias."),
+    "12": ("PTR", "The endpoint asked for a reverse DNS hostname lookup."),
+    "15": ("MX", "The endpoint asked for mail exchange server records."),
+    "16": ("TXT", "The endpoint asked for text metadata records."),
+    "28": ("AAAA", "The endpoint asked for an IPv6 address."),
+    "33": ("SRV", "The endpoint asked for service location records."),
+    "65": ("HTTPS", "The endpoint asked for HTTPS service-binding information."),
 }
 
 
-DNS_TYPE_NAMES = {
-    "1": "A",
-    "5": "CNAME",
-    "12": "PTR",
-    "15": "MX",
-    "16": "TXT",
-    "28": "AAAA",
-    "33": "SRV",
-    "65": "HTTPS",
-}
-
-SERVICE_NAMES = {
-    20: "FTP data",
-    21: "FTP control",
-    22: "SSH",
-    23: "Telnet",
-    25: "SMTP",
-    53: "DNS",
-    67: "DHCP server",
-    68: "DHCP client",
-    80: "HTTP",
-    110: "POP3",
-    123: "NTP",
-    143: "IMAP",
-    389: "LDAP",
-    443: "HTTPS",
-    445: "SMB",
-    587: "SMTP submission",
-    636: "LDAPS",
-    853: "DNS over TLS",
-    993: "IMAPS",
-    995: "POP3S",
-    3389: "RDP",
-}
-
-
-def run_tshark(command):
-    """Run tshark and return its standard output."""
-
-    return subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-
-
-def read_protocols(capture_file):
-    """Return the protocol shown by Wireshark for every packet."""
-
-    command = [
-        "tshark",
-        "-r",
-        str(capture_file),
-        "-T",
-        "fields",
-        "-e",
-        "_ws.col.Protocol",
-    ]
-
-    output = run_tshark(command)
-
-    protocols = []
-
-    for line in output.splitlines():
-        protocol = line.strip()
-
-        if protocol:
-            protocols.append(protocol)
-
-    return protocols
-
-
-def split_values(value):
-    """Split comma-separated tshark values and remove empty entries."""
-
-    if not value:
+def _split_values(raw_val: str) -> list[str]:
+    if not raw_val:
         return []
+    return [item.strip() for item in raw_val.split(",") if item.strip()]
 
-    return [
-        item.strip().rstrip(".")
-        for item in value.split(",")
-        if item.strip()
+
+def _format_endpoint(ipv4: str, ipv6: str, port: str) -> str:
+    if ipv4:
+        return f"{ipv4}:{port}" if port else ipv4
+    if ipv6:
+        return f"[{ipv6}]:{port}" if port else f"[{ipv6}]"
+    return f"unknown:{port}" if port else "unknown"
+
+
+def _classify_service(ports: set[str], protocols: set[str]) -> str:
+    upper_protos = {p.upper() for p in protocols}
+    if "HTTP" in upper_protos or "80" in ports or "8080" in ports:
+        return "HTTP"
+    if "TLS" in upper_protos or "SSL" in upper_protos or "443" in ports or "8443" in ports:
+        return "HTTPS"
+    if "SSH" in upper_protos or "22" in ports:
+        return "SSH"
+    if "DNS" in upper_protos or "53" in ports:
+        return "DNS"
+    return "Unknown / App"
+
+
+def build_tab_reports(pcap_path: str) -> dict:
+    if not os.path.isfile(pcap_path):
+        raise FileNotFoundError(f"Capture file not found: {pcap_path}")
+
+    fields = [
+        "frame.number",
+        "frame.len",
+        "frame.protocols",
+        "ip.src",
+        "ip.dst",
+        "ipv6.src",
+        "ipv6.dst",
+        "tcp.stream",
+        "tcp.srcport",
+        "tcp.dstport",
+        "tcp.flags.syn",
+        "tcp.flags.ack",
+        "tcp.len",
+        "dns.qry.name",
+        "dns.qry.type",
+        "dns.flags.response",
+        "dns.a",
+        "dns.aaaa",
+        "dns.cname",
+        "dns.ptr.domain_name",
     ]
 
-
-def read_dns_activity(capture_file):
-    """Extract DNS questions and answers from the capture."""
-
-    command = [
+    cmd = [
         "tshark",
         "-r",
-        str(capture_file),
-        "-Y",
-        "dns",
+        pcap_path,
         "-T",
         "fields",
         "-E",
         "separator=\t",
         "-E",
         "occurrence=a",
-        "-E",
-        "aggregator=,",
-        "-e",
-        "dns.flags.response",
-        "-e",
-        "dns.qry.name",
-        "-e",
-        "dns.qry.type",
-        "-e",
-        "dns.a",
-        "-e",
-        "dns.aaaa",
-        "-e",
-        "dns.cname",
     ]
+    for field in fields:
+        cmd.extend(["-e", field])
 
-    output = run_tshark(command)
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0 and not proc.stdout.strip():
+        err_msg = proc.stderr.strip() or "tshark failed to read the capture file."
+        raise RuntimeError(err_msg)
 
-    activity = defaultdict(
+    total_packets = 0
+    encrypted_packets = 0
+    http_packets = 0
+    local_discovery_packets = 0
+    nat_traversal_packets = 0
+    protocol_counts = defaultdict(int)
+
+    dns_records = defaultdict(
         lambda: {
-            "query_types": set(),
-            "ipv4": set(),
-            "ipv6": set(),
-            "cnames": set(),
+            "types": set(),
             "queries": 0,
             "responses": 0,
+            "ipv4": set(),
+            "ipv6": set(),
+            "aliases": set(),
         }
     )
 
-    for line in output.splitlines():
-        fields = line.split("\t")
+    streams = {}
 
-        while len(fields) < 6:
-            fields.append("")
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        cols = line.split("\t")
+        while len(cols) < len(fields):
+            cols.append("")
 
         (
-            response_flag,
-            query_names,
-            query_types,
-            ipv4_answers,
-            ipv6_answers,
-            cname_answers,
-        ) = fields[:6]
+            _frame_num,
+            frame_len_raw,
+            protocols_raw,
+            ip_src,
+            ip_dst,
+            ipv6_src,
+            ipv6_dst,
+            tcp_stream_raw,
+            tcp_srcport,
+            tcp_dstport,
+            syn_raw,
+            ack_raw,
+            tcp_len_raw,
+            dns_qry_name,
+            dns_qry_type,
+            dns_resp_flag,
+            dns_a,
+            dns_aaaa,
+            dns_cname,
+            dns_ptr,
+        ) = cols[: len(fields)]
 
-        names = split_values(query_names)
-        types = split_values(query_types)
-        ipv4 = split_values(ipv4_answers)
-        ipv6 = split_values(ipv6_answers)
-        cnames = split_values(cname_answers)
+        total_packets += 1
+        frame_len = int(frame_len_raw) if frame_len_raw.isdigit() else 0
 
-        if not names:
-            continue
+        proto_chain = [p.lower() for p in protocols_raw.split(":") if p]
+        proto_set = set(proto_chain)
 
-        # tshark on this system returns True/False.
-        # We also support 1/0 for compatibility.
-        response_value = response_flag.strip().lower()
+        if proto_chain:
+            top_proto = proto_chain[-1].upper()
+            protocol_counts[top_proto] += 1
 
-        for name in names:
-            entry = activity[name]
+        if {"tls", "ssl", "ssh", "wg", "quic"} & proto_set:
+            encrypted_packets += 1
+        if "http" in proto_set and "tls" not in proto_set:
+            http_packets += 1
+        if {"arp", "ssdp", "mdns", "llmnr", "nbns"} & proto_set:
+            local_discovery_packets += 1
+        if {"stun", "turn"} & proto_set:
+            nat_traversal_packets += 1
 
-            if response_value in ("0", "false"):
-                entry["queries"] += 1
+        # DNS parsing
+        q_names = _split_values(dns_qry_name)
+        q_types = _split_values(dns_qry_type)
+        is_response = dns_resp_flag.lower() in ("1", "true")
 
-            elif response_value in ("1", "true"):
-                entry["responses"] += 1
+        if q_names:
+            for idx, domain in enumerate(q_names):
+                entry = dns_records[domain]
+                if is_response:
+                    entry["responses"] += 1
+                else:
+                    entry["queries"] += 1
 
-            for query_type in types:
-                entry["query_types"].add(
-                    DNS_TYPE_NAMES.get(
-                        query_type,
-                        f"TYPE {query_type}",
-                    )
+                q_code = q_types[idx] if idx < len(q_types) else (q_types[0] if q_types else "")
+                if q_code:
+                    q_label, _ = DNS_TYPE_MAP.get(q_code, (f"TYPE-{q_code}", ""))
+                    entry["types"].add((q_code, q_label))
+
+                for v4 in _split_values(dns_a):
+                    entry["ipv4"].add(v4)
+                for v6 in _split_values(dns_aaaa):
+                    entry["ipv6"].add(v6)
+                for cname in _split_values(dns_cname):
+                    entry["aliases"].add(cname)
+                for ptr in _split_values(dns_ptr):
+                    entry["aliases"].add(ptr)
+
+        # TCP stream parsing
+        if tcp_stream_raw != "":
+            for s_id_str in _split_values(tcp_stream_raw):
+                if not s_id_str.isdigit():
+                    continue
+                sid = int(s_id_str)
+                src_ep = _format_endpoint(
+                    _split_values(ip_src)[0] if ip_src else "",
+                    _split_values(ipv6_src)[0] if ipv6_src else "",
+                    _split_values(tcp_srcport)[0] if tcp_srcport else "",
+                )
+                dst_ep = _format_endpoint(
+                    _split_values(ip_dst)[0] if ip_dst else "",
+                    _split_values(ipv6_dst)[0] if ipv6_dst else "",
+                    _split_values(tcp_dstport)[0] if tcp_dstport else "",
                 )
 
-            entry["ipv4"].update(ipv4)
-            entry["ipv6"].update(ipv6)
-            entry["cnames"].update(cnames)
-
-    return activity
-
-def read_tcp_conversations(capture_file):
-    """Extract TCP streams and determine whether a handshake was observed."""
-
-    command = [
-        "tshark",
-        "-r",
-        str(capture_file),
-        "-Y",
-        "tcp",
-        "-T",
-        "fields",
-        "-E",
-        "separator=\t",
-        "-e",
-        "tcp.stream",
-        "-e",
-        "ip.src",
-        "-e",
-        "ipv6.src",
-        "-e",
-        "tcp.srcport",
-        "-e",
-        "ip.dst",
-        "-e",
-        "ipv6.dst",
-        "-e",
-        "tcp.dstport",
-        "-e",
-        "frame.len",
-        "-e",
-        "tcp.flags.syn",
-        "-e",
-        "tcp.flags.ack",
-        "-e",
-        "tcp.len",
-    ]
-
-    output = run_tshark(command)
-    conversations = {}
-
-    for line in output.splitlines():
-        fields = line.split("\t")
-
-        while len(fields) < 11:
-            fields.append("")
-
-        (
-            stream_id,
-            ipv4_source,
-            ipv6_source,
-            source_port,
-            ipv4_destination,
-            ipv6_destination,
-            destination_port,
-            frame_length,
-            syn_flag,
-            ack_flag,
-            tcp_payload_length,
-        ) = fields[:11]
-
-        if not stream_id or not source_port or not destination_port:
-            continue
-
-        source_ip = ipv4_source or ipv6_source
-        destination_ip = ipv4_destination or ipv6_destination
-
-        if not source_ip or not destination_ip:
-            continue
-
-        source_port_number = int(source_port)
-        destination_port_number = int(destination_port)
-
-        if stream_id not in conversations:
-            conversations[stream_id] = {
-                "stream_id": int(stream_id),
-                "endpoint_a_ip": source_ip,
-                "endpoint_a_port": source_port_number,
-                "endpoint_b_ip": destination_ip,
-                "endpoint_b_port": destination_port_number,
-                "packets": 0,
-                "bytes": 0,
-                "payload_bytes": 0,
-                "syn": False,
-                "syn_ack": False,
-                "final_ack": False,
-            }
-
-        conversation = conversations[stream_id]
-
-        conversation["packets"] += 1
-
-        if frame_length:
-            conversation["bytes"] += int(frame_length)
-
-        if tcp_payload_length:
-            conversation["payload_bytes"] += int(tcp_payload_length)
-
-        # tshark on this system returns True/False.
-        # Also accepting 1/0 makes the parser portable.
-        syn_is_set = syn_flag.strip().lower() in ("1", "true")
-        ack_is_set = ack_flag.strip().lower() in ("1", "true")
-
-        if syn_is_set and not ack_is_set:
-            conversation["syn"] = True
-
-        elif syn_is_set and ack_is_set:
-            conversation["syn_ack"] = True
-
-        elif ack_is_set and not syn_is_set:
-            conversation["final_ack"] = True
-
-    return sorted(
-        conversations.values(),
-        key=lambda conversation: conversation["bytes"],
-        reverse=True,
-    )
-
-
-
-def explain_protocol(protocol):
-    """Return a simple explanation for a protocol."""
-
-    return PROTOCOL_EXPLANATIONS.get(
-        protocol,
-        "No simple explanation has been added for this protocol yet.",
-    )
-
-
-def explain_dns_type(query_type):
-    """Return a simple explanation for a DNS query type."""
-
-    explanations = {
-        "A": "The endpoint asked for an IPv4 address.",
-        "AAAA": "The endpoint asked for an IPv6 address.",
-        "CNAME": "The endpoint asked about a canonical-name alias.",
-        "PTR": "The endpoint asked for a reverse DNS name.",
-        "MX": "The endpoint asked for mail-server information.",
-        "TXT": "The endpoint asked for a DNS text record.",
-        "SRV": "The endpoint asked where a particular service is available.",
-        "HTTPS": "The endpoint asked for HTTPS service-binding information.",
-    }
-
-    return explanations.get(
-        query_type,
-        "The endpoint requested this DNS record type.",
-    )
-
-
-def print_protocol_summary(protocols):
-    """Print protocol counts and explanations."""
-
-    counts = Counter(protocols)
-
-    print("=== PROTOCOL SUMMARY ===")
-    print()
-
-    for protocol, count in counts.most_common():
-        print(f"{protocol:12} {count}")
-
-    print()
-    print("=== WHAT THE PROTOCOLS MEAN ===")
-
-    for protocol, count in counts.most_common():
-        print()
-        print(f"{protocol} ({count} packets)")
-        print(explain_protocol(protocol))
-
-    return counts
-
-
-def print_dns_activity(activity):
-    """Print human-readable DNS questions and answers."""
-
-    print()
-    print("=== DNS ACTIVITY ===")
-
-    if not activity:
-        print()
-        print("No DNS activity was found in this capture.")
-        return
-
-    for domain in sorted(activity):
-        entry = activity[domain]
-
-        print()
-        print(f"Domain: {domain}")
-
-        if entry["query_types"]:
-            types = ", ".join(sorted(entry["query_types"]))
-            print(f"Query type(s): {types}")
-
-            for query_type in sorted(entry["query_types"]):
-                print(f"  - {query_type}: {explain_dns_type(query_type)}")
-
-        print(f"Queries observed: {entry['queries']}")
-        print(f"Responses observed: {entry['responses']}")
-
-        if entry["cnames"]:
-            print("Aliases returned:")
-
-            for cname in sorted(entry["cnames"]):
-                print(f"  {domain} -> {cname}")
-
-        if entry["ipv4"]:
-            print("IPv4 answer(s):")
-
-            for address in sorted(entry["ipv4"]):
-                print(f"  {domain} -> {address}")
-
-        if entry["ipv6"]:
-            print("IPv6 answer(s):")
-
-            for address in sorted(entry["ipv6"]):
-                print(f"  {domain} -> {address}")
-
-        if not entry["ipv4"] and not entry["ipv6"] and not entry["cnames"]:
-            print("No address answer was visible in the captured DNS packets.")
-
-
-def print_security_summary(protocol_counts, dns_activity):
-    """Print a cautious summary based only on observed evidence."""
-
-    encrypted_packets = (
-        protocol_counts.get("TLS", 0)
-        + protocol_counts.get("TLSv1.2", 0)
-        + protocol_counts.get("TLSv1.3", 0)
-        + protocol_counts.get("SSL", 0)
-        + protocol_counts.get("SSH", 0)
-    )
-
-    discovery_packets = (
-        protocol_counts.get("ARP", 0)
-        + protocol_counts.get("SSDP", 0)
-    )
-
-    nat_traversal_packets = (
-        protocol_counts.get("STUN", 0)
-        + protocol_counts.get("NAT-PMP", 0)
-        + protocol_counts.get("PCP v2", 0)
-    )
-
-    print()
-    print("=== SECURITY SUMMARY ===")
-    print()
-
-    print(f"Unique DNS names observed: {len(dns_activity)}")
-    print(f"Encrypted-protocol packets observed: {encrypted_packets}")
-    print(f"Local discovery packets observed: {discovery_packets}")
-    print(f"NAT-traversal-related packets observed: {nat_traversal_packets}")
-
-    print()
-    print("Observations:")
-
-    if encrypted_packets:
-        print(
-            "- Encrypted traffic was present. IP addresses, ports, timing, "
-            "and packet sizes remain observable, while application content "
-            "is protected."
-        )
-
-    if dns_activity:
-        print(
-            "- DNS activity exposed the domain names requested by the endpoint "
-            "and, where captured, the returned IP addresses."
-        )
-
-    if discovery_packets:
-        print(
-            "- Local-network discovery activity was present through protocols "
-            "such as ARP or SSDP."
-        )
-
-    if nat_traversal_packets:
-        print(
-            "- NAT traversal or mapping-related activity was present. "
-            "This can be normal for real-time, peer-to-peer, or "
-            "device-connectivity applications."
-        )
-
-    print()
-    print(
-        "Important: these are observations, not proof of malicious activity."
-    )
-
-def guess_service(port_a, port_b):
-    """Guess the application service from a known TCP port."""
-
-    if port_a in SERVICE_NAMES:
-        return SERVICE_NAMES[port_a], port_a
-
-    if port_b in SERVICE_NAMES:
-        return SERVICE_NAMES[port_b], port_b
-
-    return "Unknown or application-specific", None
-
-
-def format_bytes(byte_count):
-    """Convert bytes into a readable value."""
-
-    if byte_count >= 1_000_000:
-        return f"{byte_count / 1_000_000:.2f} MB"
-
-    if byte_count >= 1_000:
-        return f"{byte_count / 1_000:.2f} KB"
-
-    return f"{byte_count} bytes"
-
-
-def print_tcp_conversations(conversations, limit=10):
-    """Explain the largest observed TCP conversations."""
-
-    print()
-    print("=== TCP CONVERSATIONS ===")
-
-    if not conversations:
-        print()
-        print("No TCP conversations were found.")
-        return
-
-    print()
-    print(
-        f"Showing the {min(limit, len(conversations))} "
-        "largest TCP conversations."
-    )
-
-    for conversation in conversations[:limit]:
-
-        service_name, service_port = guess_service(
-            conversation["endpoint_a_port"],
-            conversation["endpoint_b_port"],
-        )
-
-        handshake_complete = (
-            conversation["syn"]
-            and conversation["syn_ack"]
-            and conversation["final_ack"]
-        )
-
-        print()
-        print("=" * 60)
-
-        print(f"TCP Stream {conversation['stream_id']}")
-
-        print()
-        print(
-            f"Endpoint A: "
-            f"{conversation['endpoint_a_ip']}:"
-            f"{conversation['endpoint_a_port']}"
-        )
-
-        print(
-            f"Endpoint B: "
-            f"{conversation['endpoint_b_ip']}:"
-            f"{conversation['endpoint_b_port']}"
-        )
-
-        print()
-        print(f"Likely service: {service_name}")
-
-        if service_port is not None:
-            print(f"Recognized server port: TCP/{service_port}")
-
-        print(f"Packets captured: {conversation['packets']}")
-
-        print(
-            f"Captured traffic: "
-            f"{format_bytes(conversation['bytes'])}"
-        )
-
-        print(
-            f"TCP payload: "
-            f"{format_bytes(conversation['payload_bytes'])}"
-        )
-
-        print()
-        print("TCP handshake:")
-
-        print(
-            "  SYN      : "
-            + (
-                "detected"
-                if conversation["syn"]
-                else "not observed"
-            )
-        )
-
-        print(
-            "  SYN/ACK  : "
-            + (
-                "detected"
-                if conversation["syn_ack"]
-                else "not observed"
-            )
-        )
-
-        print(
-            "  ACK      : "
-            + (
-                "detected"
-                if conversation["final_ack"]
-                else "not observed"
-            )
-        )
-
-        print()
-
-        if handshake_complete:
-            print(
-                "Result: TCP connection establishment "
-                "was observed successfully."
-            )
+                if sid not in streams:
+                    streams[sid] = {
+                        "stream_id": sid,
+                        "src": src_ep,
+                        "dst": dst_ep,
+                        "ports": set(),
+                        "protocols": set(),
+                        "packets": 0,
+                        "bytes": 0,
+                        "payload_bytes": 0,
+                        "syn": False,
+                        "syn_ack": False,
+                        "ack": False,
+                    }
+
+                st = streams[sid]
+                st["packets"] += 1
+                st["bytes"] += frame_len
+                if tcp_len_raw.isdigit():
+                    st["payload_bytes"] += int(tcp_len_raw)
+                if tcp_srcport:
+                    st["ports"].add(_split_values(tcp_srcport)[0])
+                if tcp_dstport:
+                    st["ports"].add(_split_values(tcp_dstport)[0])
+                st["protocols"].update(proto_set)
+
+                syn_on = syn_raw.lower() in ("1", "true")
+                ack_on = ack_raw.lower() in ("1", "true")
+                if syn_on and not ack_on:
+                    st["syn"] = True
+                elif syn_on and ack_on:
+                    st["syn_ack"] = True
+                elif not syn_on and ack_on:
+                    st["ack"] = True
+
+    # Build structured TCP stream objects sorted by packet volume
+    tcp_streams_list = []
+    tcp_text_blocks = []
+    complete_handshakes = 0
+
+    for sid, st in sorted(streams.items(), key=lambda item: item[1]["packets"], reverse=True):
+        hs_complete = st["syn"] and st["syn_ack"] and st["ack"]
+        if hs_complete:
+            complete_handshakes += 1
+
+        service = _classify_service(st["ports"], st["protocols"])
+        syn_txt = "detected" if st["syn"] else "not observed"
+        synack_txt = "detected" if st["syn_ack"] else "not observed"
+        ack_txt = "detected" if st["ack"] else "not observed"
+
+        if hs_complete:
+            hs_result = "TCP connection establishment was observed successfully."
         else:
-            print(
-                "Result: The complete TCP handshake was "
-                "not visible in this capture."
-            )
-            print(
-                "The capture may have started after the "
-                "connection was already established."
+            hs_result = (
+                "The complete handshake was not visible.\n"
+                "The connection may have existed before the capture started."
             )
 
-        print()
-
-        if service_name == "HTTPS":
-            print(
-                "Explanation: This is likely encrypted web traffic."
+        sec_note = ""
+        if service == "HTTPS":
+            sec_note = (
+                "\nSecurity context: encrypted web traffic is likely.\n"
+                "IP addresses, ports, timing, and traffic volume remain visible."
             )
-            print(
-                "IP addresses, ports, timing, and traffic volume "
-                "remain visible even though the application "
-                "content is protected by TLS."
+        elif service == "HTTP":
+            sec_note = (
+                "\nSecurity context: unencrypted HTTP traffic detected.\n"
+                "URLs, headers, and payload data may be observable in cleartext."
             )
-
-        elif service_name == "SSH":
-            print(
-                "Explanation: This is likely an encrypted "
-                "remote administration session."
-            )
-
-        elif service_name == "HTTP":
-            print(
-                "Explanation: This appears to be HTTP traffic."
-            )
-            print(
-                "Unlike HTTPS, HTTP application content may "
-                "be visible in a packet capture."
+        elif service == "SSH":
+            sec_note = (
+                "\nSecurity context: encrypted remote administration session (SSH).\n"
+                "Session metadata and packet timing remain observable."
             )
 
-        elif service_name == "DNS over TLS":
-            print(
-                "Explanation: DNS traffic may be transported "
-                "inside an encrypted TLS connection."
-            )
+        detail_block = (
+            f"========================================================================\n"
+            f"TCP Stream {sid} | Likely service: {service}\n"
+            f"------------------------------------------------------------------------\n"
+            f"Endpoint A: {st['src']}\n"
+            f"Endpoint B: {st['dst']}\n\n"
+            f"Packets captured: {st['packets']}\n"
+            f"Captured bytes: {st['bytes']}\n"
+            f"TCP payload bytes: {st['payload_bytes']}\n\n"
+            f"Handshake evidence:\n"
+            f"  SYN:     {syn_txt}\n"
+            f"  SYN/ACK: {synack_txt}\n"
+            f"  ACK:     {ack_txt}\n\n"
+            f"Result: {hs_result}\n"
+            f"{sec_note}"
+        ).strip()
 
+        tcp_streams_list.append(
+            {
+                "stream_id": sid,
+                "src": st["src"],
+                "dst": st["dst"],
+                "service": service,
+                "packets": st["packets"],
+                "bytes": st["bytes"],
+                "payload_bytes": st["payload_bytes"],
+                "handshake_complete": hs_complete,
+                "details": detail_block,
+            }
+        )
+        tcp_text_blocks.append(detail_block)
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage:")
-        print("python pcap_explainer.py <capture.pcapng>")
-        sys.exit(1)
+    # Build DNS report text
+    dns_lines = ["=== DNS ACTIVITY ===", ""]
+    if not dns_records:
+        dns_lines.append("No DNS queries or responses were observed in this capture.")
+    else:
+        for domain in sorted(dns_records.keys()):
+            info = dns_records[domain]
+            sorted_types = sorted(info["types"], key=lambda t: int(t[0]) if t[0].isdigit() else 999)
+            type_names = ", ".join(t[1] for t in sorted_types) if sorted_types else "Unknown"
+            dns_lines.append(f"Domain: {domain}")
+            dns_lines.append(f"Query type(s): {type_names}")
+            for _, label in sorted_types:
+                for code, (lbl, desc) in DNS_TYPE_MAP.items():
+                    if lbl == label and desc:
+                        dns_lines.append(f"  - {lbl}: {desc}")
+                        break
+            dns_lines.append(f"Queries observed: {info['queries']}")
+            dns_lines.append(f"Responses observed: {info['responses']}")
+            if info["aliases"]:
+                dns_lines.append("Aliases returned:")
+                for alias in sorted(info["aliases"]):
+                    dns_lines.append(f"  {domain} -> {alias}")
+            if info["ipv4"]:
+                dns_lines.append("IPv4 answer(s):")
+                for v4 in sorted(info["ipv4"]):
+                    dns_lines.append(f"  {domain} -> {v4}")
+            if info["ipv6"]:
+                dns_lines.append("IPv6 answer(s):")
+                for v6 in sorted(info["ipv6"]):
+                    dns_lines.append(f"  {domain} -> {v6}")
+            dns_lines.append("")
 
-    capture_file = Path(sys.argv[1])
+    # Build Summary report text
+    filename = os.path.basename(pcap_path)
+    summary_lines = [
+        "PCAP EXPLAINER V6",
+        "================================================================",
+        f"Capture: {filename}",
+        f"Packets analyzed: {total_packets}",
+        "",
+        "CAPTURE OVERVIEW",
+        "----------------------------------------------------------------",
+        f"{'Metric':<40} {'Value':>12}",
+        "----------------------------------------------------------------",
+        f"{'Total packets':<40} {total_packets:>12}",
+        f"{'Unique DNS names':<40} {len(dns_records):>12}",
+        f"{'TCP conversations':<40} {len(streams):>12}",
+        f"{'Complete TCP handshakes':<40} {complete_handshakes:>12}",
+        f"{'Encrypted-protocol packets':<40} {encrypted_packets:>12}",
+        f"{'HTTP packets':<40} {http_packets:>12}",
+        "----------------------------------------------------------------",
+        "",
+        "TOP OBSERVED PROTOCOLS",
+        "----------------------------------------------------------------",
+    ]
+    for proto, cnt in sorted(protocol_counts.items(), key=lambda x: x[1], reverse=True)[:12]:
+        summary_lines.append(f"  {proto:<20} {cnt:>10} packets")
 
-    if not capture_file.exists():
-        print(f"Error: {capture_file} does not exist.")
-        sys.exit(1)
+    # Build Security report text
+    sec_lines = [
+        "=== SECURITY SUMMARY ===",
+        "",
+        f"Unique DNS names observed: {len(dns_records)}",
+        f"Encrypted-protocol packets observed: {encrypted_packets}",
+        f"Local discovery packets observed: {local_discovery_packets}",
+        f"NAT-traversal-related packets observed: {nat_traversal_packets}",
+        "",
+        "Evidence-Based Observations:",
+    ]
+    if encrypted_packets > 0:
+        sec_lines.append(
+            f"[OK] Encrypted traffic was detected ({encrypted_packets} packets). "
+            "Application payloads are protected, while IPs, ports, timing, and volume remain visible."
+        )
+    if len(dns_records) > 0:
+        sec_lines.append(
+            f"[INFO] DNS visibility exposed {len(dns_records)} unique requested domain name(s)."
+        )
+    if complete_handshakes > 0:
+        sec_lines.append(
+            f"[OK] Complete TCP 3-way handshake establishment was observed for {complete_handshakes} conversation(s)."
+        )
+    if http_packets == 0:
+        sec_lines.append("[OK] No traffic was classified as plaintext HTTP.")
+    else:
+        sec_lines.append(
+            f"[WARN] Cleartext HTTP traffic detected ({http_packets} packets). "
+            "Inspect affected TCP streams for unencrypted data exposure."
+        )
+    if local_discovery_packets > 0:
+        sec_lines.append(
+            f"[INFO] Local-network discovery activity observed ({local_discovery_packets} ARP/mDNS/SSDP packets)."
+        )
+    sec_lines.extend(
+        [
+            "",
+            "Important: these are evidence-based observations, not proof of malicious activity.",
+        ]
+    )
 
-    try:
-        protocols = read_protocols(capture_file)
-        dns_activity = read_dns_activity(capture_file)
-        tcp_conversations = read_tcp_conversations(capture_file)
-
-    except FileNotFoundError:
-        print("Error: tshark is not installed or is not available in PATH.")
-        sys.exit(1)
-
-    except subprocess.CalledProcessError as error:
-        print("Error: tshark could not read the capture.")
-        print(error.stderr)
-        sys.exit(1)
-
-    print()
-    print("=== PCAP EXPLAINER V4 ===")
-    print()
-    print(f"Capture: {capture_file.name}")
-    print(f"Packets analyzed: {len(protocols)}")
-    print()
-
-    protocol_counts = print_protocol_summary(protocols)
-
-    print_dns_activity(dns_activity)
-
-    print_tcp_conversations(tcp_conversations)
-
-    print_security_summary(
-    protocol_counts,
-    dns_activity,
-)
+    return {
+        "summary_metrics": {
+            "total_packets": total_packets,
+            "unique_dns": len(dns_records),
+            "tcp_conversations": len(streams),
+            "complete_handshakes": complete_handshakes,
+            "encrypted_packets": encrypted_packets,
+            "http_packets": http_packets,
+        },
+        "tcp_streams": tcp_streams_list,
+        "summary": "\n".join(summary_lines),
+        "dns": "\n".join(dns_lines),
+        "tcp": "\n\n".join(tcp_text_blocks) if tcp_text_blocks else "No TCP streams observed.",
+        "security": "\n".join(sec_lines),
+    }
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if len(sys.argv) > 1:
+        res = build_tab_reports(sys.argv[1])
+        print(res["summary"])
+        print()
+        print(res["security"])
