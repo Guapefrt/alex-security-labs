@@ -1,0 +1,7 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Local runtime audit logs
+logs/*.jsonl
+logs/*.log
